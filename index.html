@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=2.0, user-scalable=yes">
+  <title>Складской учёт</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; font-size: 24px; margin: 0; padding: 0; width: 100%; }
+    h2 { font-size: 36px; margin: 12px 0; }
+    h3 { font-size: 30px; margin: 14px 0; }
+    select, input[type="text"], input[type="number"], button { font-size: 24px; padding: 16px 14px; margin: 10px 0; width: 100%; border: 1px solid #aaa; border-radius: 6px; }
+    table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    th, td { border: 1px solid #ccc; padding: 14px 10px; text-align: left; font-size: 24px; }
+    th { background: #f0f0f0; font-weight: bold; }
+    .btn-sm { font-size: 22px; padding: 10px 14px; width: auto; }
+    .container { padding: 16px; }
+    .map-container { overflow-x: auto; margin: 16px 0; }
+    .map-table { min-width: 100%; width: 100%; margin-bottom: 20px; }
+    .map-table td, .map-table th { font-size: 20px; padding: 8px 6px; text-align: center; }
+    .map-table .row-header { text-align: left; font-weight: bold; background: #f0f0f0; }
+    .map-table .zone-title { background: #e3f2fd; font-weight: bold; font-size: 24px; text-align: left; padding: 12px 10px; }
+    .occupied { background: #c8e6c9; }
+    .map-table a { text-decoration: none; color: #1a73e8; cursor: pointer; }
+    .msg { background: #e8f5e9; border: 1px solid #4caf50; padding: 16px; border-radius: 6px; margin: 12px 0; font-size: 24px; }
+    .back-btn { display: inline-block; font-size: 24px; padding: 16px 28px; background: #e0e0e0; border: 1px solid #aaa; border-radius: 6px; text-decoration: none; color: #000; margin: 12px 0; cursor: pointer; }
+    #searchResults { margin-top: 16px; }
+    .status-msg { font-size: 20px; color: #888; margin-top: 4px; }
+    #offlineIndicator { position: fixed; bottom: 20px; right: 20px; background: #ff9800; color: white; padding: 12px 20px; border-radius: 30px; font-size: 20px; display: none; z-index: 1000; }
+    #syncQueueCount { background: #f44336; border-radius: 50%; padding: 2px 8px; margin-left: 8px; font-size: 18px; display: none; }
+  </style>
+</head>
+<body>
+<div class="container" id="app">
+  <!-- динамическое содержимое -->
+</div>
+<div id="offlineIndicator">📡 Офлайн <span id="syncQueueCount"></span></div>
+
+<script>
+// ==================== КОНФИГУРАЦИЯ ====================
+const API_BASE = 'https://script.google.com/macros/s/AKfycbxBJk4aJ4G0JdVrA3hnEMxUfqTTMxqw_Ya-87E9f-s6gXVAfvJPh1lzoLUjD37bUUm9-w/exec';
+const STORAGE_KEY = 'warehouse_offline_queue';
+
+// ==================== ГЛОБАЛЬНОЕ СОСТОЯНИЕ ====================
+let currentView = 'main'; // 'main' или 'pallet'
+let currentPalletId = null;
+let profilesLoaded = false;
+let profilesCache = [];
+
+// ==================== ИНИЦИАЛИЗАЦИЯ ====================
+window.addEventListener('load', () => {
+  registerSW();
+  checkOnlineStatus();
+  loadMainView();
+  window.addEventListener('online', handleOnline);
+  window.addEventListener('offline', handleOffline);
+});
+
+function registerSW() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(err => console.log('SW registration failed', err));
+  }
+}
+
+async function checkOnlineStatus() {
+  if (!navigator.onLine) showOfflineIndicator();
+  else hideOfflineIndicator();
+}
+
+function handleOnline() {
+  hideOfflineIndicator();
+  processOfflineQueue();
+}
+
+function handleOffline() {
+  showOfflineIndicator();
+}
+
+function showOfflineIndicator() {
+  document.getElementById('offlineIndicator').style.display = 'block';
+  updateQueueBadge();
+}
+
+function hideOfflineIndicator() {
+  document.getElementById('offlineIndicator').style.display = 'none';
+}
+
+async function updateQueueBadge() {
+  const queue = await getOfflineQueue();
+  const badge = document.getElementById('syncQueueCount');
+  if (queue.length > 0) {
+    badge.textContent = queue.length;
+    badge.style.display = 'inline';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+// ==================== ОФЛАЙН-ОЧЕРЕДЬ (IndexedDB) ====================
+function openQueueDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('WarehouseQueue', 1);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('actions')) {
+        db.createObjectStore('actions', { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    request.onsuccess = (e) => resolve(e.target.result);
+    request.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function addToOfflineQueue(action) {
+  const db = await openQueueDB();
+  const tx = db.transaction('actions', 'readwrite');
+  tx.objectStore('actions').add({ ...action, timestamp: Date.now() });
+  await tx.complete;
+  db.close();
+  updateQueueBadge();
+  showOfflineIndicator();
+}
+
+async function getOfflineQueue() {
+  const db = await openQueueDB();
+  const tx = db.transaction('actions', 'readonly');
+  const store = tx.objectStore('actions');
+  const request = store.getAll();
+  await tx.complete;
+  db.close();
+  return request.result || [];
+}
+
+async function clearOfflineQueue() {
+  const db = await openQueueDB();
+  const tx = db.transaction('actions', 'readwrite');
+  tx.objectStore('actions').clear();
+  await tx.complete;
+  db.close();
+  updateQueueBadge();
+}
+
+async function processOfflineQueue() {
+  const queue = await getOfflineQueue();
+  if (queue.length === 0) return;
+  for (const item of queue) {
+    try {
+      const response = await fetch(API_BASE, {
+        method: 'POST',
+        body: new URLSearchParams(item.params)
+      });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+    } catch (err) {
+      console.warn('Sync failed for', item, err);
+      return; // stop processing, will retry later
+    }
+  }
+  await clearOfflineQueue();
+  // Refresh current view if needed
+  if (currentView === 'pallet' && currentPalletId) {
+    loadPalletView(currentPalletId);
+  } else {
+    loadMainView();
+  }
+}
+
+// ==================== НАВИГАЦИЯ ====================
+function navigate(view, palletId = null) {
+  if (view === 'main') {
+    loadMainView();
+  } else if (view === 'pallet') {
+    loadPalletView(palletId);
+  }
+}
+
+// ==================== ЗАГРУЗКА ГЛАВНОЙ СТРАНИЦЫ ====================
+async function loadMainView() {
+  currentView = 'main';
+  currentPalletId = null;
+  const app = document.getElementById('app');
+  app.innerHTML = '<p>Загрузка...</p>';
+  try {
+    const [mapHtml, totalPallets, ids] = await Promise.all([
+      fetchMapHtml(), fetchTotalPallets(), fetchPalletIds()
+    ]);
+    let html = '<h2>Складской учёт</h2>';
+    html += '<label>Выберите паллету:</label><br>';
+    html += '<select id="palletSelect">';
+    ids.forEach(id => html += `<option value="${id}">${id}</option>`);
+    html += '</select><br><button onclick="goToPallet()">Перейти</button>';
+    if (mapHtml) {
+      html += '<hr><h3>Карта склада</h3>';
+      html += `<p><strong>Занято: ${totalPallets} / 145</strong></p>`;
+      html += `<div class="map-container">${mapHtml}</div>`;
+    }
+    html += '<hr><h3>Поиск паллеты по профилю</h3>';
+    html += '<label>Профиль:</label><br>';
+    html += '<input type="text" id="searchProfileInput" list="profileListMain" autocomplete="off" placeholder="Начните вводить...">';
+    html += '<datalist id="profileListMain"></datalist>';
+    html += '<div id="profileSearchStatus" class="status-msg"></div>';
+    html += '<br><button onclick="searchByProfile()">🔍 Искать</button>';
+    html += '<div id="searchResults"></div>';
+    app.innerHTML = html;
+    loadProfilesForDatalist('profileListMain', 'profileSearchStatus');
+    document.getElementById('palletSelect').addEventListener('change', (e) => {
+      if (e.target.value) navigate('pallet', e.target.value);
+    });
+  } catch (err) {
+    app.innerHTML = '<p style="color:red">Ошибка загрузки главной страницы.</p>';
+    console.error(err);
+  }
+}
+
+async function fetchMapHtml() {
+  try {
+    const zones = await (await fetch(`${API_BASE}?action=getMapData`)).json();
+    return buildMapHtml(zones);
+  } catch (e) {
+    return '';
+  }
+}
+
+async function fetchTotalPallets() {
+  const zones = await (await fetch(`${API_BASE}?action=getMapData`)).json();
+  let count = 0;
+  zones.forEach(z => z.rows.forEach(r => r.data.forEach(cell => { if (cell.trim() !== '') count++; })));
+  return count;
+}
+
+async function fetchPalletIds() {
+  const res = await fetch(`${API_BASE}?action=getPalletIds`);
+  return await res.json();
+}
+
+function buildMapHtml(zones) {
+  let html = '';
+  zones.forEach(zone => {
+    html += `<table class="map-table"><thead><tr><th class="zone-title" colspan="${zone.colCount + 1}">Зона ${zone.name}</th></tr>`;
+    html += '<tr><th class="row-header">Ур.</th>';
+    for (let c = 1; c <= zone.colCount; c++) html += `<th>${c}</th>`;
+    html += '</tr></thead><tbody>';
+    zone.rows.forEach(row => {
+      html += `<tr><td class="row-header">${row.level}</td>`;
+      for (let c = 0; c < zone.colCount; c++) {
+        const val = row.data[c] || '';
+        const cellClass = val ? 'occupied' : '';
+        const cellContent = val ? `<a onclick="navigate('pallet','${val}')">${val}</a>` : '';
+        html += `<td class="${cellClass}">${cellContent}</td>`;
+      }
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+  });
+  return html;
+}
+
+async function loadProfilesForDatalist(listId, statusId) {
+  const statusDiv = document.getElementById(statusId);
+  statusDiv.textContent = '⏳ Загрузка профилей...';
+  try {
+    if (!profilesLoaded) {
+      profilesCache = await (await fetch(`${API_BASE}?action=getProfiles`)).json();
+      profilesLoaded = true;
+    }
+    const dl = document.getElementById(listId);
+    dl.innerHTML = '';
+    profilesCache.forEach(p => dl.innerHTML += `<option value="${p}">`);
+    statusDiv.textContent = `✅ Загружено ${profilesCache.length} профилей`;
+    statusDiv.style.color = '#2e7d32';
+    setTimeout(() => statusDiv.textContent = '', 3000);
+  } catch (err) {
+    statusDiv.textContent = '❌ Ошибка загрузки профилей';
+    statusDiv.style.color = '#c62828';
+    console.error(err);
+  }
+}
+
+function goToPallet() {
+  const select = document.getElementById('palletSelect');
+  if (select.value) navigate('pallet', select.value);
+}
+
+async function searchByProfile() {
+  const profile = document.getElementById('searchProfileInput').value.trim();
+  if (!profile) return alert('Введите профиль');
+  const div = document.getElementById('searchResults');
+  div.innerHTML = 'Поиск...';
+  try {
+    const data = await (await fetch(`${API_BASE}?action=findProfile&profile=${encodeURIComponent(profile)}`)).json();
+    if (data.length === 0) { div.innerHTML = '<p>Профиль не найден ни в одной паллете.</p>'; return; }
+    let h = '<table><tr><th>Паллета</th><th>Кол-во</th></tr>';
+    data.forEach(item => h += `<tr><td><a onclick="navigate('pallet','${item.pallet}')">${item.pallet}</a></td><td>${item.qty}</td></tr>`);
+    h += '</table>';
+    div.innerHTML = h;
+  } catch (err) {
+    div.innerHTML = '<p>Ошибка поиска.</p>';
+  }
+}
+
+// ==================== КАРТОЧКА ПАЛЛЕТЫ ====================
+async function loadPalletView(id) {
+  currentView = 'pallet';
+  currentPalletId = id;
+  const app = document.getElementById('app');
+  app.innerHTML = '<p>Загрузка...</p>';
+  try {
+    const [palletData, locations, otherPallets] = await Promise.all([
+      fetch(`${API_BASE}?action=getPalletData&id=${id}`).then(r => r.json()),
+      fetch(`${API_BASE}?action=getMapLocations&palletId=${id}`).then(r => r.json()),
+      fetch(`${API_BASE}?action=getOtherPallets&id=${id}`).then(r => r.json())
+    ]);
+    renderPallet(id, palletData, locations, otherPallets);
+  } catch (err) {
+    app.innerHTML = `<p style="color:red">Ошибка загрузки паллеты ${id}.</p>`;
+    console.error(err);
+  }
+}
+
+function renderPallet(id, palletData, locations, otherPallets) {
+  const { location, items } = palletData;
+  let html = `<h2>Паллета ${id}</h2>`;
+  html += `<p><strong>Текущее место:</strong> ${location}</p>`;
+  html += '<hr><h3>Состав паллеты</h3>';
+  if (items.length === 0) {
+    html += '<p>Нет данных о содержимом.</p>';
+  } else {
+    html += '<form id="contentForm"><table>';
+    items.forEach((item, idx) => {
+      html += `<tr><td>${item.profile}</td><td><input type="number" name="qty_${idx}" value="${item.qty}" min="0" style="width:80px;"></td>`;
+      html += `<td><button type="button" class="btn-sm" onclick="deleteItem('${item.profile}')">🗑</button></td></tr>`;
+      html += `<input type="hidden" name="profile_${idx}" value="${item.profile}">`;
+    });
+    html += '</table><button type="button" onclick="updateContent()">💾 Сохранить количества</button></form>';
+  }
+  // Добавить профиль
+  html += '<hr><h3>Добавить профиль</h3>';
+  html += '<input type="text" id="newProfileInput" list="profileList" autocomplete="off" placeholder="Начните вводить...">';
+  html += '<datalist id="profileList"></datalist>';
+  html += '<div id="profileLoadStatus" class="status-msg"></div>';
+  html += '<input type="number" id="newQty" value="0" min="0"><br>';
+  html += '<button onclick="addItem()">➕ Добавить</button>';
+  // Переместить профиль
+  if (items.length > 0 && otherPallets.length > 0) {
+    html += '<hr><h3>Переместить профиль на другую паллету</h3>';
+    html += '<select id="moveProfile">';
+    items.forEach(item => html += `<option value="${item.profile}">${item.profile}</option>`);
+    html += '</select><br>';
+    html += '<input type="number" id="moveQty" value="1" min="1"><br>';
+    html += '<select id="targetPallet">';
+    otherPallets.forEach(p => html += `<option value="${p}">${p}</option>`);
+    html += '</select><br><button onclick="moveItem()">📦 Переместить</button>';
+  }
+  // Переместить паллету
+  html += '<hr><h3>Переместить паллету</h3>';
+  html += '<select id="newLocation">';
+  locations.forEach(loc => html += `<option value="${loc}" ${loc === location ? 'selected' : ''}>${loc}</option>`);
+  html += '</select><br><button onclick="movePallet()">🚚 Переместить</button>';
+  html += '<hr><button class="back-btn" onclick="navigate(\'main\')">← Назад к карте склада</button>';
+  const app = document.getElementById('app');
+  app.innerHTML = html;
+  loadProfilesForDatalist('profileList', 'profileLoadStatus');
+}
+
+// ==================== ДЕЙСТВИЯ С ПАЛЛЕТОЙ ====================
+async function apiPost(params) {
+  if (!navigator.onLine) {
+    await addToOfflineQueue({ params });
+    updateQueueBadge();
+    showOfflineIndicator();
+    alert('Изменение сохранено локально и будет отправлено при появлении сети.');
+    return { success: true, message: 'Сохранено офлайн' };
+  }
+  const response = await fetch(API_BASE, { method: 'POST', body: new URLSearchParams(params) });
+  return await response.json();
+}
+
+async function addItem() {
+  const profile = document.getElementById('newProfileInput').value.trim();
+  const qty = parseInt(document.getElementById('newQty').value) || 0;
+  if (!profile || qty <= 0) return alert('Укажите профиль и количество > 0');
+  const result = await apiPost({ action: 'addItem', id: currentPalletId, newProfile: profile, newQty: qty });
+  alert(result.message);
+  if (result.success) loadPalletView(currentPalletId);
+}
+
+async function updateContent() {
+  const form = document.getElementById('contentForm');
+  const formData = new FormData(form);
+  const params = new URLSearchParams();
+  params.append('action', 'updateContent');
+  params.append('id', currentPalletId);
+  for (const [key, value] of formData.entries()) {
+    params.append(key, value);
+  }
+  const result = await apiPost(params);
+  alert(result.message);
+  if (result.success) loadPalletView(currentPalletId);
+}
+
+async function deleteItem(profile) {
+  if (!confirm(`Удалить профиль ${profile}?`)) return;
+  const result = await apiPost({ action: 'deleteItem', id: currentPalletId, profile: profile });
+  alert(result.message);
+  if (result.success) loadPalletView(currentPalletId);
+}
+
+async function moveItem() {
+  const profile = document.getElementById('moveProfile').value;
+  const moveQty = document.getElementById('moveQty').value;
+  const targetId = document.getElementById('targetPallet').value;
+  if (!profile || !targetId || moveQty < 1) return alert('Заполните все поля');
+  const result = await apiPost({ action: 'moveItem', sourceId: currentPalletId, profile, moveQty, targetId });
+  alert(result.message);
+  if (result.success) loadPalletView(currentPalletId);
+}
+
+async function movePallet() {
+  const newLocation = document.getElementById('newLocation').value;
+  if (!newLocation) return;
+  const result = await apiPost({ action: 'move', id: currentPalletId, newLocation });
+  alert(result.message);
+  if (result.success) loadPalletView(currentPalletId);
+}
+</script>
+</body>
+</html>
